@@ -1,5 +1,6 @@
 #include "clip.h"
 #include "llava-utils.h"
+#include "console.h"
 #include "common.h"
 #include "llama.h"
 
@@ -7,10 +8,67 @@
 #include <cstdlib>
 #include <vector>
 
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+#include <signal.h>
+#include <unistd.h>
+#elif defined (_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <signal.h>
+#endif
+
+struct llama_data_context {
+    virtual void write(const void * src, size_t size) = 0;
+    virtual size_t get_size_written() = 0;
+    virtual ~llama_data_context() = default;
+};
+
+struct llama_data_buffer_context : llama_data_context {
+    uint8_t * ptr;
+    size_t size_written = 0;
+
+    llama_data_buffer_context(uint8_t * p) : ptr(p) {}
+
+    void write(const void * src, size_t size) override {
+        memcpy(ptr, src, size);
+        ptr += size;
+        size_written += size;
+    }
+
+    size_t get_size_written() override {
+        return size_written;
+    }
+};
+
 static void show_additional_info(int /*argc*/, char ** argv) {
     printf("\n example usage: %s -m <llava-v1.5-7b/ggml-model-q5_k.gguf> --mmproj <llava-v1.5-7b/mmproj-model-f16.gguf> --image <path/to/an/image.jpg> [--temp 0.1] [-p \"describe the image in detail.\"]\n", argv[0]);
     printf("  note: a lower temperature value like 0.1 is recommended for better quality.\n");
 }
+
+bool is_interacting;
+bool is_processing;
+uint32_t unhandled_ctrl_c = 0;
+
+llama_context * ctx_llama;
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
+static void sigint_handler(int signo) {
+    if (signo == SIGINT) {
+        if (is_interacting && is_processing) {
+            is_processing = false;
+            unhandled_ctrl_c++;
+        } else {
+            console::cleanup();
+            printf("\n");
+            llama_print_timings(ctx_llama);
+            _exit(130);
+        }
+    }
+}
+#endif
 
 int main(int argc, char ** argv) {
     ggml_time_init();
@@ -33,6 +91,22 @@ int main(int argc, char ** argv) {
 
     if (params.prompt.empty()) {
         params.prompt = "describe the image in detail.";
+    }
+
+    if(params.interactive) {
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+        struct sigaction sigint_action;
+        sigint_action.sa_handler = sigint_handler;
+        sigemptyset (&sigint_action.sa_mask);
+        sigint_action.sa_flags = 0;
+        sigaction(SIGINT, &sigint_action, NULL);
+#elif defined (_WIN32)
+        auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
+            return (ctrl_type == CTRL_C_EVENT) ? (sigint_handler(SIGINT), true) : false;
+        };
+        SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
+#endif
+
     }
 
     auto ctx_clip = clip_model_load(clip_path, /*verbosity=*/ 1);
@@ -99,7 +173,7 @@ int main(int argc, char ** argv) {
     ctx_params.n_threads_batch = params.n_threads_batch == -1 ? params.n_threads : params.n_threads_batch;
     ctx_params.seed            = params.seed;
 
-    llama_context * ctx_llama = llama_new_context_with_model(model, ctx_params);
+    ctx_llama = llama_new_context_with_model(model, ctx_params);
 
     if (ctx_llama == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
@@ -123,27 +197,95 @@ int main(int argc, char ** argv) {
     // process the prompt
     // llava chat format is "<system_prompt>USER: <image_embeddings>\n<textual_prompt>\nASSISTANT:"
 
-    int n_past = 0;
+    int n_past, initial_n_past;
 
     const int max_tgt_len = params.n_predict < 0 ? 256 : params.n_predict;
-
-    eval_string(ctx_llama, "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions.\nUSER:", params.n_batch, &n_past, true);
-    eval_image_embd(ctx_llama, image_embd, n_img_pos, params.n_batch, &n_past);
-    eval_string(ctx_llama, (params.prompt + "\nASSISTANT:").c_str(), params.n_batch, &n_past, false);
 
     // generate the response
 
     printf("\n");
-    printf("prompt: '%s'\n", params.prompt.c_str());
+    if(params.interactive) {
+        printf("Interaction mode enabled.\n");
+    }
+    else {
+        printf("prompt: '%s'\n", params.prompt.c_str());
+    }
     printf("\n");
 
-    for (int i = 0; i < max_tgt_len; i++) {
-        const char * tmp = sample(ctx_llama, params, &n_past);
-        if (strcmp(tmp, "</s>") == 0) break;
+    printf("Generating initial embeddings\n");
 
-        printf("%s", tmp);
-        fflush(stdout);
-    }
+    eval_string(ctx_llama, "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions.\nUSER:", params.n_batch, &initial_n_past, true);
+    eval_image_embd(ctx_llama, image_embd, n_img_pos, params.n_batch, &initial_n_past);
+
+    size_t max_size = llama_get_state_size(ctx_llama);
+    printf("Using copy buffer of size: %zu\n", max_size);
+    fflush(stdout);
+
+    std::vector<uint8_t> copy_buffer(max_size, 0);
+    llama_copy_state_data(ctx_llama, copy_buffer.data());
+
+    is_interacting = params.interactive;
+
+    do {
+        std::string prompt;
+        if(is_interacting) {
+            printf("\nWaiting for prompt\n> ");
+            console::set_display(console::user_input);
+
+            std::string buffer;
+            std::string line;
+            bool another_line = true;
+            do {
+                another_line = console::readline(line, params.multiline_input);
+                buffer += line;
+
+                if(unhandled_ctrl_c > 2) {
+                    is_interacting = false;
+                    break;
+                }
+            } while (another_line);
+
+            // done taking input, reset color
+            console::set_display(console::reset);
+
+            prompt = buffer;
+
+            if(!is_interacting) { // CTRL+C
+                break;
+            }
+            
+            unhandled_ctrl_c = 0;
+        }
+        else {
+            prompt = params.prompt;
+        }
+
+        n_past = initial_n_past;
+        is_processing = true;
+
+        eval_string(ctx_llama, (prompt + "\nASSISTANT:").c_str(), params.n_batch, &n_past, false);
+
+        for (int i = 0; i < max_tgt_len && is_processing; i++) {
+            const char * tmp = sample(ctx_llama, params, &n_past);
+            if (strcmp(tmp, "</s>") == 0) break;
+
+            printf("%s", tmp);
+            fflush(stdout);
+        }
+
+        if(!is_processing) {
+            printf("\nCTRL+C received.\n\n");
+        }
+
+        if(unhandled_ctrl_c > 2) {
+            break;
+        }
+
+        unhandled_ctrl_c = 0;
+
+        llama_set_state_data(ctx_llama, copy_buffer.data());
+        // llama_kv_cache_tokens_rm(ctx_llama, -1, -1);
+    } while(is_interacting);
 
     printf("\n");
 
