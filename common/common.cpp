@@ -145,6 +145,12 @@ bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
                 break;
             }
             params.prompt = argv[i];
+        } else if (arg == "-I" || arg == "--initial-prompt") {
+            if (++i > argc) {
+                invalid_param = true;
+                break;
+            }
+            params.llava_prompt = argv[i];
         } else if (arg == "-e" || arg == "--escape") {
             params.escape = true;
         } else if (arg == "--prompt-cache") {
